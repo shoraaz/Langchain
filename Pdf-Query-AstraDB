@@ -1,0 +1,120 @@
+import os
+from typing import List
+from dotenv import load_dotenv
+import PyPDF2
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Cassandra
+from langchain_openai import OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain_openai import ChatOpenAI
+from cassandra.cluster import Cluster
+from cassandra.auth import PlainTextAuthProvider
+
+# Load environment variables
+load_dotenv()
+
+# API keys and credentials
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ASTRA_DB_ID = os.getenv("ASTRA_DB_ID")
+ASTRA_DB_REGION = os.getenv("ASTRA_DB_REGION")
+ASTRA_DB_APPLICATION_TOKEN = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+ASTRA_DB_KEYSPACE = os.getenv("ASTRA_DB_KEYSPACE", "default_keyspace")
+
+# Configure Astra DB connection
+SECURE_CONNECT_BUNDLE_PATH = os.getenv("SECURE_CONNECT_BUNDLE_PATH", "secure-connect-bundle.zip")
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extract text from a PDF file."""
+    with open(pdf_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page_num in range(len(reader.pages)):
+            text += reader.pages[page_num].extract_text()
+    return text
+
+def split_text_into_chunks(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
+    """Split text into overlapping chunks."""
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len
+    )
+    return text_splitter.split_text(text)
+
+def setup_vector_store(text_chunks: List[str]):
+    """Set up vector store in Astra DB."""
+    # Connect to Astra DB
+    cloud_config = {
+        'secure_connect_bundle': SECURE_CONNECT_BUNDLE_PATH
+    }
+    auth_provider = PlainTextAuthProvider('token', ASTRA_DB_APPLICATION_TOKEN)
+    cluster = Cluster(cloud=cloud_config, auth_provider=auth_provider)
+    session = cluster.connect()
+    
+    # Initialize embeddings
+    embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+    
+    # Create vector store
+    vector_store = Cassandra.from_texts(
+        texts=text_chunks,
+        embedding=embeddings,
+        session=session,
+        keyspace=ASTRA_DB_KEYSPACE,
+        table_name="pdf_embeddings"
+    )
+    
+    return vector_store
+
+def setup_qa_system(vector_store):
+    """Set up question answering system with retrieval-based QA."""
+    llm = ChatOpenAI(
+        temperature=0,
+        model_name="gpt-3.5-turbo",
+        api_key=OPENAI_API_KEY
+    )
+    
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=vector_store.as_retriever(search_kwargs={"k": 3})
+    )
+    
+    return qa_chain
+
+def main():
+    print("PDF Querying with Astra and LangChain")
+    
+    # Check for environment variables
+    if not all([OPENAI_API_KEY, ASTRA_DB_ID, ASTRA_DB_REGION, ASTRA_DB_APPLICATION_TOKEN]):
+        raise ValueError("Missing required environment variables. Please check your .env file.")
+    
+    # Get PDF path from user
+    pdf_path = input("Enter the path to your PDF file: ")
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found at: {pdf_path}")
+    
+    print("Extracting text from PDF...")
+    pdf_text = extract_text_from_pdf(pdf_path)
+    
+    print("Splitting text into chunks...")
+    text_chunks = split_text_into_chunks(pdf_text)
+    print(f"Created {len(text_chunks)} text chunks")
+    
+    print("Setting up vector store in Astra DB...")
+    vector_store = setup_vector_store(text_chunks)
+    
+    print("Setting up question answering system...")
+    qa_system = setup_qa_system(vector_store)
+    
+    print("\nYour PDF is ready for questions! Type 'exit' to quit.")
+    
+    while True:
+        question = input("\nAsk a question about your PDF: ")
+        if question.lower() == 'exit':
+            break
+            
+        response = qa_system.invoke({"query": question})
+        print("\nAnswer:", response["result"])
+
+if __name__ == "__main__":
+    main()
